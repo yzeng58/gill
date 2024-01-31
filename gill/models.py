@@ -14,8 +14,8 @@ from PIL import Image, UnidentifiedImageError
 from requests.exceptions import ConnectionError
 
 from transformers import AutoTokenizer, AutoModel, CLIPVisionModel, OPTForCausalLM
-from gill import utils
-from gill import layers
+from models.gill.gill import utils
+from models.gill.gill import layers
 
 
 class GILLArgs:
@@ -535,7 +535,7 @@ class GILLModel(nn.Module):
 class GILL(nn.Module):
   def __init__(self, tokenizer, model_args: Optional[GILLArgs] = None,
                path_array: Optional[List[str]] = None, emb_matrix: Optional[torch.tensor] = None,
-               load_sd: bool = False, num_gen_images: int = 1, decision_model_path: Optional[str] = None):
+               load_sd: bool = False, num_gen_images: int = 1, decision_model_path: Optional[str] = None, device = 'cuda'):
     super().__init__()
     self.model = GILLModel(tokenizer, model_args)
     self.path_array = path_array
@@ -548,7 +548,7 @@ class GILL(nn.Module):
     # Load the Stable Diffusion model.
     if load_sd:
       model_id = "runwayml/stable-diffusion-v1-5"
-      self.sd_pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+      self.sd_pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
 
     if decision_model_path is not None:
       print('Loading decision model...')
@@ -707,7 +707,7 @@ class GILL(nn.Module):
           gen_prefix = ' '.join([f'[IMG{i}]' for i in range(self.model.args.num_tokens)])
           gen_prefx_ids = self.model.tokenizer(gen_prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(self.model.logit_scale.device)
           gen_prefix_embs = self.model.input_embeddings(gen_prefx_ids)  # (1, T, D)
-          gen_emb = self.model.gen_text_hidden_fcs[0](raw_emb, gen_prefix_embs)  # (1, 77, 768)
+          gen_emb = self.model.gen_text_hidden_fcs[0](raw_emb, gen_prefix_embs[:,ret_idx:ret_idx+self.model.num_tokens,:])  # (1, 77, 768)
 
           if gen_emb.shape[1] != 77:
             print(f"Padding {gen_emb.shape} with zeros")
@@ -807,7 +807,7 @@ class GILL(nn.Module):
     return -outputs.loss.item()  
 
 
-def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str = 'decision_model.pth.tar') -> GILL:
+def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str = 'decision_model.pth.tar', device = 'cuda') -> GILL:
   model_args_path = os.path.join(model_dir, 'model_args.json')
   model_ckpt_path = os.path.join(model_dir, 'pretrained_ckpt.pth.tar')
   embs_paths = [s for s in glob.glob(os.path.join(model_dir, 'cc3m*.npy'))]
@@ -871,10 +871,20 @@ def load_gill(model_dir: str, load_ret_embs: bool = True, decision_model_fn: str
 
   # Initialize model for inference.
   model = GILL(tokenizer, args, path_array=path_array, emb_matrix=emb_matrix,
-               load_sd=True, num_gen_images=1, decision_model_path=decision_model_path)
+               load_sd=True, num_gen_images=1, decision_model_path=decision_model_path, device = device)
   model = model.eval()
   model = model.bfloat16()
-  model = model.cuda()
+  
+  if device == 'cuda':
+    model = model.cuda()
+  elif device == 'cpu':
+    model = model.cpu()
+  elif device[:5] == 'cuda:':
+    model = model.cuda(int(device[5:]))
+  else:
+    raise ValueError(f'Invalid device: {device}')
+    
+    
 
   # Load pretrained linear mappings and [IMG] embeddings.
   checkpoint = torch.load(model_ckpt_path)
